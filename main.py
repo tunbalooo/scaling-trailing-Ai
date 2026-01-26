@@ -378,3 +378,46 @@ def webhook_root():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
+def to_float(x):
+    try:
+        if x is None: return None
+        s = str(x).strip().lower()
+        if s in ("na", "n/a", "none", "null", ""): return None
+        return float(s)
+    except:
+        return None
+
+def fix_tp_if_wrong(side, price, sl, tp, rr=1.5):
+    # only fix if we have price + sl
+    if price is None or sl is None:
+        return tp
+    risk = abs(price - sl)
+    if risk <= 0:
+        return tp
+
+    if side == "BUY":
+        good = (tp is not None) and (tp > price)
+        return tp if good else (price + risk * rr)
+
+    if side == "SELL":
+        good = (tp is not None) and (tp < price)
+        return tp if good else (price - risk * rr)
+
+    return tp
+
+
+side = direction  # "BUY" or "SELL"
+price_f = to_float(price)
+sl_f    = to_float(sl)
+tp_f    = to_float(tp)
+
+tp_f = fix_tp_if_wrong(side, price_f, sl_f, tp_f, rr=1.5)
+
+# format back for message
+price = f"{price_f:.2f}" if price_f is not None else str(price)
+sl    = f"{sl_f:.2f}"    if sl_f is not None else str(sl)
+tp    = f"{tp_f:.2f}"    if tp_f is not None else "N/A"
+
+
+
