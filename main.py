@@ -1,190 +1,220 @@
 import os
 import json
-from datetime import datetime
-from flask import Flask, request, jsonify
 import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# In-memory storage (resets if Railway restarts)
-last_trade = {}  # key: symbol -> dict(entry, side, tf, time)
-stats = {
-    "wins": 0,
-    "losses": 0,
-    "total": 0
-}
+# =========================
+# Config (Railway env vars)
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def send_telegram(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID).")
+        return {"ok": False, "error": "telegram_not_configured"}
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
+        r = requests.post(url, json=payload, timeout=10)
         return r.json()
-    except Exception:
-        return {"ok": False, "error": "Telegram response not JSON", "raw": r.text}
+    except Exception as e:
+        print("Telegram send error:", e)
+        return {"ok": False, "error": str(e)}
 
-def to_float(x):
+# -------------------------
+# Helpers
+# -------------------------
+def _to_float(x):
+    """Convert TradingView strings like 'null', 'na', '' to None or float."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().lower()
+    if s in ("", "na", "n/a", "null", "none"):
+        return None
     try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s.lower() in ("na", "n/a", "null", ""):
-            return None
         return float(s)
     except Exception:
         return None
 
-def fmt(x, nd=2):
-    v = to_float(x)
-    if v is None:
-        return "N/A"
-    return f"{v:.{nd}f}"
+def _to_int(x, default=0):
+    if x is None:
+        return default
+    try:
+        return int(float(x))
+    except Exception:
+        return default
 
-def build_message(payload: dict) -> str:
-    event = payload.get("event", {}) if isinstance(payload.get("event", {}), dict) else {}
-    typ = str(event.get("type", "ENTRY")).upper()
-    side = str(event.get("side", "N/A")).upper()
-
-    symbol = str(payload.get("symbol", "N/A"))
-    tf     = str(payload.get("tf", "N/A"))
-
-    price = to_float(payload.get("price"))
-    sl    = to_float(payload.get("sl"))
-    tp    = to_float(payload.get("tp"))
-    score = to_float(payload.get("score"))
-    adds  = payload.get("adds", 0)
-
-    # Grade for display
-    grade = "N/A"
-    if score is not None:
-        if score >= 80: grade = "A"
-        elif score >= 65: grade = "B"
-        elif score >= 50: grade = "C"
-        else: grade = "SKIP"
-
-    lines = []
-    if typ == "TRAIL":
-        lines.append("🏁 TRAIL EXIT")
-    elif typ == "SCALE":
-        lines.append("➕ SCALE ALERT")
-    else:
-        lines.append("📊 TRADE ALERT")
-
-    lines.append("")
-    lines.append(f"{symbol} — {side}")
-    lines.append(f"Type: {typ}")
-    lines.append(f"TF: {tf}")
-    lines.append("")
-    lines.append(f"Entry/Price: {fmt(price, 2)}")
-    lines.append(f"SL: {fmt(sl, 2)}")
-    lines.append(f"TP: {fmt(tp, 2)}")
-    lines.append(f"Adds: {adds}")
+def grade(score):
     if score is None:
-        lines.append(f"Score: N/A (N/A)")
+        return "N/A"
+    if score >= 80:
+        return "A"
+    if score >= 65:
+        return "B"
+    if score >= 50:
+        return "C"
+    return "SKIP"
+
+def infer_side(data):
+    """
+    If you didn't send side, infer it:
+    - If buyScore > sellScore => BUY
+    - Else SELL
+    """
+    bs = _to_float(data.get("buyScore"))
+    ss = _to_float(data.get("sellScore"))
+    if bs is None and ss is None:
+        return "N/A"
+    if ss is None:
+        return "BUY"
+    if bs is None:
+        return "SELL"
+    return "BUY" if bs >= ss else "SELL"
+
+def choose_score_and_grade(side, data):
+    bs = _to_float(data.get("buyScore"))
+    ss = _to_float(data.get("sellScore"))
+    if side == "BUY":
+        sc = bs
+    elif side == "SELL":
+        sc = ss
     else:
-        lines.append(f"Score: {int(score)} ({grade})")
+        sc = None
+    return sc, grade(sc)
 
-    return "\n".join(lines)
+def fix_tp_direction(side, price, sl, tp):
+    """
+    Ensures TP is on the correct side of entry.
+    If tp is wrong/missing, compute a safe TP using same RR as implied by SL distance (default 1.5R).
+    """
+    if price is None or sl is None:
+        return tp  # can't fix
 
-def label_outcome(symbol: str, exit_price: float, exit_side: str):
-    """
-    Uses last stored ENTRY for that symbol.
-    WIN logic:
-      - If last entry was BUY, WIN if exit_price > entry_price
-      - If last entry was SELL, WIN if exit_price < entry_price
-    """
-    t = last_trade.get(symbol)
-    if not t:
+    rr_default = 1.5
+    risk = abs(price - sl)
+    if risk <= 0:
+        return tp
+
+    # If tp missing, set it
+    if tp is None:
+        if side == "BUY":
+            return price + risk * rr_default
+        if side == "SELL":
+            return price - risk * rr_default
         return None
 
-    entry_price = t["entry_price"]
-    entry_side  = t["side"]
+    # If tp exists but wrong side, flip it
+    if side == "BUY" and tp <= price:
+        return price + risk * rr_default
+    if side == "SELL" and tp >= price:
+        return price - risk * rr_default
 
-    if entry_side == "BUY":
-        win = exit_price > entry_price
-    elif entry_side == "SELL":
-        win = exit_price < entry_price
-    else:
-        return None
+    return tp
 
-    stats["total"] += 1
-    if win:
-        stats["wins"] += 1
-        result = "WIN ✅"
-    else:
-        stats["losses"] += 1
-        result = "LOSS ❌"
-
-    return {
-        "result": result,
-        "entry_side": entry_side,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
-        "symbol": symbol
-    }
-
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def home():
-    return jsonify({"ok": True, "message": "Webhook is running. Use POST /webhook"})
+    return "OK"
 
-@app.get("/test")
-def test():
+@app.get("/test_telegram")
+def test_telegram():
     r = send_telegram("✅ Telegram test successful")
     return jsonify(r), (200 if r.get("ok") else 500)
 
-@app.get("/stats")
-def get_stats():
-    return jsonify(stats)
-
 @app.post("/webhook")
 def webhook():
-    payload = request.get_json(silent=True)
+    raw = request.get_data(as_text=True) or ""
 
-    if payload is None:
-        # If TradingView sent text instead of JSON
-        raw = request.data.decode("utf-8", errors="ignore")
-        send_telegram("⚠️ NON-JSON ALERT BODY:\n" + raw[:1800])
-        return jsonify({"ok": False, "error": "Non-JSON body"}), 400
+    # 1) Try parse JSON safely
+    try:
+        data = request.get_json(force=True, silent=False)
+    except Exception:
+        # Non-JSON payload (common when alert_message not quoted)
+        msg = "⚠️ NON-JSON ALERT BODY RECEIVED:\n" + raw[:1500]
+        send_telegram(msg)
+        return jsonify({"ok": False, "error": "non_json", "raw": raw[:300]}), 400
 
-    # Parse event
-    event = payload.get("event", {}) if isinstance(payload.get("event", {}), dict) else {}
-    typ = str(event.get("type", "ENTRY")).upper()
-    side = str(event.get("side", "N/A")).upper()
+    # 2) Normalize fields
+    event = str(data.get("event", "")).strip().upper()  # ENTRY / SCALE / TRAIL
+    symbol = str(data.get("symbol", "N/A"))
+    tf     = str(data.get("tf", "N/A"))
 
-    symbol = str(payload.get("symbol", "N/A"))
-    price  = to_float(payload.get("price"))
+    price  = _to_float(data.get("price"))
+    sl     = _to_float(data.get("sl"))
+    tp     = _to_float(data.get("tp"))
+    adds   = _to_int(data.get("adds"), default=0)
 
-    # Store ENTRY as last trade (for win/loss labeling on TRAIL)
-    if typ == "ENTRY" and price is not None and side in ("BUY", "SELL"):
-        last_trade[symbol] = {
-            "side": side,
-            "entry_price": price,
-            "time": datetime.utcnow().isoformat()
-        }
+    # If event came from alertcondition message, it will be ENTRY/SCALE/TRAIL
+    if event not in ("ENTRY", "SCALE", "TRAIL"):
+        # Sometimes people send "ENTRY BUY" etc — keep it readable
+        if "ENTRY" in event:
+            event = "ENTRY"
+        elif "SCALE" in event:
+            event = "SCALE"
+        elif "TRAIL" in event:
+            event = "TRAIL"
+        else:
+            event = "ENTRY"
 
-    # If TRAIL, label outcome
-    if typ == "TRAIL" and price is not None:
-        outcome = label_outcome(symbol, price, side)
-        if outcome:
-            msg = (
-                f"📌 OUTCOME SAVED\n\n"
-                f"{outcome['symbol']} ({outcome['entry_side']})\n"
-                f"Entry: {outcome['entry_price']:.2f}  Exit: {outcome['exit_price']:.2f}\n"
-                f"Result: {outcome['result']}\n\n"
-                f"Totals — Wins: {stats['wins']} | Losses: {stats['losses']} | Total: {stats['total']}"
-            )
-            send_telegram(msg)
+    # 3) Side + score
+    side = str(data.get("side") or "").upper().strip()
+    if side not in ("BUY", "SELL"):
+        side = infer_side(data)
 
-    # Always send the alert summary
-    msg = build_message(payload)
-    send_telegram(msg)
+    score, g = choose_score_and_grade(side, data)
 
-    return jsonify({"ok": True})
+    # 4) Fix TP direction if needed
+    tp_fixed = fix_tp_direction(side, price, sl, tp)
+    if tp is None and tp_fixed is not None:
+        tp = tp_fixed
+    elif tp_fixed is not None:
+        tp = tp_fixed
 
+    # 5) Build message
+    def fmt(x, nd=2):
+        if x is None:
+            return "N/A"
+        try:
+            return f"{float(x):.{nd}f}"
+        except Exception:
+            return str(x)
+
+    warning = ""
+    if price is not None and tp is not None:
+        if side == "BUY" and tp <= price:
+            warning = "⚠️ TP should be ABOVE entry for BUY\n"
+        if side == "SELL" and tp >= price:
+            warning = "⚠️ TP should be BELOW entry for SELL\n"
+
+    text = (
+        f"📊 TRADE ALERT\n\n"
+        f"{symbol} — {side}\n"
+        f"Type: {event}\n"
+        f"TF: {tf}\n\n"
+        f"Entry/Price: {fmt(price, 2)}\n"
+        f"SL: {fmt(sl, 2)}\n"
+        f"TP: {fmt(tp, 2)}\n"
+        f"Adds: {adds}\n"
+        f"Score: {fmt(score, 0)} ({g})\n"
+    )
+
+    if warning:
+        text += "\n" + warning
+
+    r = send_telegram(text)
+    return jsonify({"ok": True, "telegram": r})
+
+# =========================
+# Run
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
