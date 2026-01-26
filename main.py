@@ -1,5 +1,8 @@
-import os, json, time
+import os
+import json
+import time
 import requests
+from typing import Any, Dict, Optional
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -7,10 +10,12 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-STATS_FILE = "stats.json"
+DATA_FILE = "trade_state.json"  # stored on Railway container (resets if redeploy)
 
-# ---------------- Telegram ----------------
-def send_telegram(text: str):
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def send_telegram(text: str) -> Dict[str, Any]:
     if not BOT_TOKEN or not CHAT_ID:
         return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}
 
@@ -23,78 +28,100 @@ def send_telegram(text: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------------- Helpers ----------------
-def safe_str(x, default="N/A"):
+def load_state() -> Dict[str, Any]:
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "open_trades": {},  # key: symbol -> trade dict
+            "stats": {}         # key: modelKey -> {wins, losses, total}
+        }
+
+def save_state(state: Dict[str, Any]) -> None:
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+def to_float(x: Any) -> Optional[float]:
     if x is None:
-        return default
-    s = str(x).strip()
-    if s == "" or s.lower() in ("na", "n/a", "null", "none"):
-        return default
-    return s
-
-def safe_float_str(x, nd=2, default="N/A"):
-    s = safe_str(x, default=default)
-    if s == default:
-        return default
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().lower()
+    if s in ("", "na", "n/a", "null", "none"):
+        return None
     try:
-        return f"{float(s):.{nd}f}"
-    except:
-        return s
+        return float(s)
+    except Exception:
+        return None
 
-def grade(score):
-    try:
-        s = float(score)
-    except:
+def fmt(x: Any, nd: int = 2) -> str:
+    v = to_float(x)
+    return f"{v:.{nd}f}" if v is not None else "N/A"
+
+def grade(score: Optional[float]) -> str:
+    if score is None:
         return "N/A"
-    return "A" if s >= 80 else "B" if s >= 65 else "C" if s >= 50 else "SKIP"
+    if score >= 80: return "A"
+    if score >= 65: return "B"
+    if score >= 50: return "C"
+    return "SKIP"
 
-def parse_payload():
-    data = request.get_json(silent=True)
-    if isinstance(data, dict):
-        return data
-    raw = request.data.decode("utf-8", errors="ignore").strip()
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except:
-        return {"_raw": raw}
+def safe_str(x: Any, fallback="N/A") -> str:
+    if x is None:
+        return fallback
+    s = str(x).strip()
+    return s if s else fallback
 
-# ---------------- Stats ----------------
-def load_stats():
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return {"overall": {"wins": 0, "losses": 0}, "by_key": {}}
+def get_event(data: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Supports:
+    - {"event":{"type":"ENTRY","side":"BUY"}, ...}
+    - {"type":"ENTRY","side":"BUY", ...}  (fallback)
+    """
+    event = data.get("event")
+    if isinstance(event, dict):
+        typ = safe_str(event.get("type", "ENTRY")).upper()
+        side = safe_str(event.get("side", "N/A")).upper()
+        return {"type": typ, "side": side}
 
-def save_stats(s):
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(s, f, indent=2)
+    # fallback
+    typ = safe_str(data.get("type", "ENTRY")).upper()
+    side = safe_str(data.get("side", "N/A")).upper()
+    return {"type": typ, "side": side}
 
-def inc_result(symbol, session, result):  # result = "WIN" or "LOSS"
-    s = load_stats()
-    key = f"{symbol}||{session}"
+def choose_score(side: str, buyScore: Any, sellScore: Any) -> Optional[float]:
+    """
+    side BUY -> buyScore
+    side SELL -> sellScore
+    """
+    if side == "BUY":
+        return to_float(buyScore)
+    if side == "SELL":
+        return to_float(sellScore)
+    # unknown side: choose whichever parses
+    return to_float(buyScore) or to_float(sellScore)
 
-    if key not in s["by_key"]:
-        s["by_key"][key] = {"wins": 0, "losses": 0}
+def win_loss_from_exit(side: str, entry: float, exit_price: float) -> str:
+    # BUY wins if exit > entry, SELL wins if exit < entry
+    if side == "BUY":
+        return "WIN" if exit_price > entry else "LOSS"
+    if side == "SELL":
+        return "WIN" if exit_price < entry else "LOSS"
+    return "LOSS"
 
-    if result == "WIN":
-        s["overall"]["wins"] += 1
-        s["by_key"][key]["wins"] += 1
-    else:
-        s["overall"]["losses"] += 1
-        s["by_key"][key]["losses"] += 1
+def model_key(symbol: str, session: str) -> str:
+    return f"{symbol}||{session}"
 
-    save_stats(s)
-    return s
-
-# ---------------- Routes ----------------
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def home():
-    return "Scaling & Trailing AI is LIVE", 200
+    return "Trade Bot is LIVE", 200
 
 @app.route("/test-telegram", methods=["GET"])
 def test_telegram():
@@ -103,98 +130,117 @@ def test_telegram():
 
 @app.route("/stats", methods=["GET"])
 def stats():
-    return jsonify(load_stats()), 200
-
-# Optional manual save (if you ever want to force a WIN/LOSS)
-@app.route("/save-outcome", methods=["POST"])
-def save_outcome():
-    data = parse_payload()
-    symbol  = safe_str(data.get("symbol"))
-    session = safe_str(data.get("session", "ALL"))
-    result  = safe_str(data.get("result")).upper()
-    if result not in ("WIN", "LOSS"):
-        return jsonify({"ok": False, "error": "result must be WIN or LOSS"}), 400
-
-    s = inc_result(symbol, session, result)
-    send_telegram(f"📌 OUTCOME SAVED\n{symbol} ({session})\nResult: {result}\nOverall: {s['overall']}")
-    return jsonify({"ok": True, "stats": s}), 200
+    state = load_state()
+    return jsonify(state.get("stats", {})), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = parse_payload()
+    state = load_state()
+    data = request.get_json(silent=True) or {}
 
-    if "_raw" in data:
-        send_telegram("⚠️ NON-JSON ALERT BODY:\n\n" + data["_raw"][:800])
-        return jsonify({"ok": True, "note": "non-json body"}), 200
-
-    event = data.get("event", {})
-    if not isinstance(event, dict):
-        event = {}
-
-    typ       = safe_str(event.get("type", "ENTRY")).upper()
-    direction = safe_str(event.get("side", "N/A")).upper()
+    ev = get_event(data)
+    typ = ev["type"]         # ENTRY / SCALE / TRAIL
+    side = ev["side"]        # BUY / SELL
 
     symbol  = safe_str(data.get("symbol"))
     tf      = safe_str(data.get("tf"))
-    session = safe_str(data.get("session", "N/A"))
+    session = safe_str(data.get("session", "N/A")).upper()
 
-    entry = safe_float_str(data.get("entry"), 2, default="N/A")
-    price = safe_float_str(data.get("price"), 2, default="N/A")
+    price = to_float(data.get("price"))
+    sl    = to_float(data.get("sl"))
+    tp    = to_float(data.get("tp"))
+    adds  = to_float(data.get("adds")) or 0.0
 
-    sl = safe_float_str(data.get("sl"), 2, default="N/A")
-    tp = safe_float_str(data.get("tp"), 2, default="N/A")
+    buyScore  = data.get("buyScore")
+    sellScore = data.get("sellScore")
+    score = choose_score(side, buyScore, sellScore)
 
-    # NEW: break-even + trail stop levels (optional)
-    be_sl     = safe_float_str(data.get("be_sl"), 2, default="N/A")
-    trail_sl  = safe_float_str(data.get("trail_sl"), 2, default="N/A")
-
-    adds = safe_float_str(data.get("adds"), 0, default="0")
-
-    buyScore  = safe_str(data.get("buyScore"))
-    sellScore = safe_str(data.get("sellScore"))
-    score = buyScore if direction == "BUY" else sellScore
-
-    score_num = safe_float_str(score, 0, default="N/A")
     g = grade(score)
 
-    # NEW: outcome labeling (your Pine/logic can send this on exit)
-    outcome = safe_str(data.get("outcome", "")).upper()  # WIN / LOSS / ""
+    # ----------------------------
+    # Save / update open trade
+    # ----------------------------
+    open_trades = state["open_trades"]
 
-    header = "📊 TRADE ALERT"
-    if typ == "SCALE":
-        header = "➕ SCALE ALERT"
+    if typ == "ENTRY":
+        # store the new entry as the "current" position for this symbol
+        if price is not None:
+            open_trades[symbol] = {
+                "side": side,
+                "entry": price,
+                "sl": sl,
+                "tp": tp,
+                "tf": tf,
+                "session": session,
+                "ts": int(time.time())
+            }
+
+    elif typ == "SCALE":
+        # scaling doesn't change entry here (you can expand later)
+        # but we keep it as info
+        pass
+
     elif typ == "TRAIL":
-        header = "🏁 TRAIL EXIT"
-    elif typ == "BE":
-        header = "🟡 MOVE SL TO BE"
-    elif typ == "TRAIL_SL":
-        header = "🟢 TRAIL SL UPDATE"
+        # on trail, label outcome if we have an open entry
+        tr = open_trades.get(symbol)
+        if tr and price is not None:
+            entry_price = float(tr["entry"])
+            entry_side  = tr["side"]
+            result = win_loss_from_exit(entry_side, entry_price, float(price))
 
-    shown_entry = entry if entry != "N/A" else price
+            key = model_key(symbol, tr.get("session", "N/A"))
+            st = state["stats"].setdefault(key, {"wins": 0, "losses": 0, "total": 0})
+            st["total"] += 1
+            if result == "WIN":
+                st["wins"] += 1
+            else:
+                st["losses"] += 1
+
+            # remove open trade after it is closed by TRAIL
+            open_trades.pop(symbol, None)
+
+            msg = (
+                f"🏁 TRAIL LABELED ({tr.get('session','N/A')})\n\n"
+                f"{symbol} — {entry_side}\n"
+                f"TF: {tr.get('tf','N/A')}\n\n"
+                f"Entry: {entry_price:.2f}  Exit: {price:.2f}\n"
+                f"Result: {result} {'✅' if result=='WIN' else '❌'}\n"
+                f"Model: {key}\n"
+                f"W/L: {st['wins']}/{st['losses']}  Total: {st['total']}"
+            )
+            send_telegram(msg)
+
+    # persist
+    save_state(state)
+
+    # ----------------------------
+    # Telegram message
+    # ----------------------------
+    header = "📊 TRADE ALERT"
+    if typ == "SCALE": header = "➕ SCALE ALERT"
+    if typ == "TRAIL": header = "🏁 TRAIL EXIT"
+
+    # sanity warning for TP direction (helps you debug instantly)
+    warn = ""
+    if price is not None and tp is not None:
+        if side == "BUY" and tp <= price:
+            warn = "⚠️ TP should be ABOVE entry for BUY\n"
+        if side == "SELL" and tp >= price:
+            warn = "⚠️ TP should be BELOW entry for SELL\n"
 
     msg = (
         f"{header}\n\n"
-        f"{symbol} — {direction}\n"
+        f"{symbol} — {side}\n"
         f"Type: {typ}\n"
         f"TF: {tf}\n"
         f"Session: {session}\n\n"
-        f"Entry: {shown_entry}\n"
-        f"SL: {sl}\n"
-        f"TP: {tp}\n"
-        f"BE SL: {be_sl}\n"
-        f"Trail SL: {trail_sl}\n"
-        f"Adds: {adds}\n"
-        f"Score: {score_num} ({g})\n"
+        f"Entry: {fmt(price)}\n"
+        f"SL: {fmt(sl)}\n"
+        f"TP: {fmt(tp)}\n"
+        f"Adds: {int(adds)}\n"
+        f"Score: {('N/A' if score is None else int(score))} ({g})\n"
+        f"{warn}"
     )
-
-    # If this alert includes WIN/LOSS, update counters + include totals
-    if outcome in ("WIN", "LOSS"):
-        s = inc_result(symbol, session, outcome)
-        msg += f"\nResult: {outcome}\nOverall W/L: {s['overall']['wins']}/{s['overall']['losses']}\n"
-
-        key = f"{symbol}||{session}"
-        wk = s["by_key"].get(key, {"wins": 0, "losses": 0})
-        msg += f"{symbol} {session} W/L: {wk['wins']}/{wk['losses']}\n"
 
     r = send_telegram(msg)
     return jsonify({"ok": r.get("ok", False), "telegram": r}), (200 if r.get("ok") else 500)
