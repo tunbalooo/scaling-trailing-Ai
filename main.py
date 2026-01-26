@@ -34,6 +34,17 @@ def test_telegram():
     return jsonify(r), (200 if r.get("ok") else 500)
 
 def build_message(data: dict) -> str:
+
+    def fnum(x, nd=2):
+    try:
+        return f"{float(x):.{nd}f}"
+    except:
+        return str(x)
+
+price = fnum(data.get("price", "N/A"), 2)
+sl    = fnum(data.get("sl", "N/A"), 2)
+tp    = fnum(data.get("tp", "N/A"), 2)
+
     """
     Expected TradingView payload (recommended):
     {
@@ -122,3 +133,4 @@ if __name__ == "__main__":
     # Local testing only. Railway uses gunicorn.
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
