@@ -148,14 +148,17 @@ def webhook():
         send_telegram(text)
         return jsonify({"ok": True})
 
-    # Trail exit = close trade + update W/L
+       # Trail exit = close trade + update W/L
     if event.upper().startswith("TRAIL"):
         last = state["last_entry"].get(symbol)
         outcome = "N/A"
 
+        # ✅ Use last_entry side for TRAIL display (this fixes N/A)
+        last_side = last.get("side", "N/A") if last else "N/A"
+        display_side = last_side if last_side in ("BUY", "SELL") else side
+
         if last and last.get("entry") is not None and price is not None:
             entry = float(last["entry"])
-            last_side = last.get("side", "N/A")
 
             if last_side == "BUY":
                 win = price > entry
@@ -173,7 +176,7 @@ def webhook():
 
         text = (
             f"🏁 TRAIL EXIT\n\n"
-            f"{symbol} — {side}\n"
+            f"{symbol} — {display_side}\n"   # ✅ FIXED HERE
             f"Type: TRAIL\n"
             f"TF: {tf}\n\n"
             f"Exit: {fmt_price(price)}\n"
@@ -183,6 +186,7 @@ def webhook():
         send_telegram(text)
         return jsonify({"ok": True})
 
+
     # Unknown event fallback
     send_telegram(f"⚠️ Unknown event\n{json.dumps(data, indent=2)}")
     return jsonify({"ok": True})
@@ -191,3 +195,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
