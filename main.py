@@ -1,330 +1,193 @@
 import os
 import json
-import csv
-import time
-import uuid
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any, List
-
-import requests
+from datetime import datetime
 from flask import Flask, request, jsonify
+import requests
 
-# ─────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────
-DATA_DIR = "data"
-STATE_JSON = os.path.join(DATA_DIR, "trades.json")
-TRADES_CSV = os.path.join(DATA_DIR, "trades.csv")
+app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SEND_TELEGRAM = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-os.makedirs(DATA_DIR, exist_ok=True)
+# In-memory state (Railway restarts will reset this)
+state = {
+    "last_entry": {},   # symbol -> {"side": "BUY/SELL", "entry": float, "sl": float|None, "tp": float|None, "time": str}
+    "stats": {}         # symbol -> {"wins": int, "losses": int}
+}
 
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
-def fnum(x) -> Optional[float]:
-    """Convert TradingView strings/nulls to float or None."""
+def to_float(x):
     if x is None:
         return None
     if isinstance(x, (int, float)):
         return float(x)
     s = str(x).strip().lower()
-    if s in ("null", "na", "none", ""):
+    if s in ("", "na", "n/a", "null", "none"):
         return None
     try:
         return float(s)
-    except ValueError:
+    except:
         return None
 
-def snum(x) -> Optional[int]:
-    if x is None:
-        return None
-    if isinstance(x, int):
-        return x
-    s = str(x).strip().lower()
-    if s in ("null", "na", "none", ""):
-        return None
-    try:
-        return int(float(s))
-    except ValueError:
-        return None
-
-def now_ts() -> int:
-    return int(time.time())
-
-def send_telegram(text: str) -> None:
-    if not SEND_TELEGRAM:
+def send_telegram(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured. Message:\n", text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
-    except Exception:
-        pass
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    r = requests.post(url, json=payload, timeout=10)
+    r.raise_for_status()
 
-# ─────────────────────────────────────────────────────────────
-# Trade model
-# ─────────────────────────────────────────────────────────────
-@dataclass
-class Trade:
-    trade_id: str
-    symbol: str
-    tf: str
-    side: str                 # "BUY" or "SELL"
-    status: str               # "OPEN" or "CLOSED"
-
-    entry_price: float
-    entry_time: int
-
-    sl: Optional[float] = None
-    tp: Optional[float] = None
-
-    adds: int = 0
-    buyScore: Optional[float] = None
-    sellScore: Optional[float] = None
-
-    tp1_hit: bool = False
-    be_armed: bool = False    # moved to break-even already or armed
-    trail_active: bool = False
-
-    exit_price: Optional[float] = None
-    exit_time: Optional[int] = None
-    exit_event: Optional[str] = None
-    result: Optional[str] = None  # "WIN" or "LOSS"
-    pnl_points: Optional[float] = None
-
-# ─────────────────────────────────────────────────────────────
-# State (in-memory + persisted)
-# ─────────────────────────────────────────────────────────────
-state: Dict[str, Any] = {
-    "open_trades": {},   # key -> Trade dict
-    "closed_trades": [], # list of Trade dict
-    "wins": 0,
-    "losses": 0,
-}
-
-def make_key(symbol: str, tf: str, side: str) -> str:
-    return f"{symbol}|{tf}|{side}"
-
-def load_state():
-    global state
-    if os.path.exists(STATE_JSON):
-        try:
-            with open(STATE_JSON, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except Exception:
-            pass
-
-def save_state():
-    with open(STATE_JSON, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-def append_csv_row(trade: Trade):
-    file_exists = os.path.exists(TRADES_CSV)
-    headers = list(asdict(trade).keys())
-    row = asdict(trade)
-
-    with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-# ─────────────────────────────────────────────────────────────
-# Core logic
-# ─────────────────────────────────────────────────────────────
-def open_trade(payload: Dict[str, Any], side: str) -> Trade:
-    symbol = str(payload.get("symbol", ""))
-    tf = str(payload.get("tf", ""))
-    price = fnum(payload.get("price")) or 0.0
-
-    trade = Trade(
-        trade_id=str(uuid.uuid4())[:8],
-        symbol=symbol,
-        tf=tf,
-        side=side,
-        status="OPEN",
-        entry_price=price,
-        entry_time=now_ts(),
-        sl=fnum(payload.get("sl")),
-        tp=fnum(payload.get("tp")),
-        adds=snum(payload.get("adds")) or 0,
-        buyScore=fnum(payload.get("buyScore")),
-        sellScore=fnum(payload.get("sellScore")),
-    )
-    key = make_key(symbol, tf, side)
-    state["open_trades"][key] = asdict(trade)
-    save_state()
-    return trade
-
-def get_open_trade(payload: Dict[str, Any], side: str) -> Optional[Trade]:
-    key = make_key(str(payload.get("symbol","")), str(payload.get("tf","")), side)
-    t = state["open_trades"].get(key)
-    return Trade(**t) if t else None
-
-def update_open_trade(trade: Trade):
-    key = make_key(trade.symbol, trade.tf, trade.side)
-    state["open_trades"][key] = asdict(trade)
-    save_state()
-
-def close_trade(trade: Trade, exit_event: str, exit_price: float) -> Trade:
-    trade.status = "CLOSED"
-    trade.exit_event = exit_event
-    trade.exit_price = exit_price
-    trade.exit_time = now_ts()
-
-    # PnL points
-    if trade.side == "BUY":
-        trade.pnl_points = exit_price - trade.entry_price
-        trade.result = "WIN" if trade.pnl_points > 0 else "LOSS"
-    else:
-        trade.pnl_points = trade.entry_price - exit_price
-        trade.result = "WIN" if trade.pnl_points > 0 else "LOSS"
-
-    # Update counters
-    if trade.result == "WIN":
-        state["wins"] = int(state.get("wins", 0)) + 1
-    else:
-        state["losses"] = int(state.get("losses", 0)) + 1
-
-    # Move to closed
-    key = make_key(trade.symbol, trade.tf, trade.side)
-    state["open_trades"].pop(key, None)
-    state["closed_trades"].append(asdict(trade))
-    save_state()
-    append_csv_row(trade)
-    return trade
-
-# ─────────────────────────────────────────────────────────────
-# Message formatting
-# ─────────────────────────────────────────────────────────────
-def grade(score: Optional[float]) -> str:
+def grade(score: float | None):
     if score is None:
-        return "N/A"
+        return ("N/A", "N/A")
     s = float(score)
-    return "A" if s >= 80 else "B" if s >= 65 else "C" if s >= 50 else "SKIP"
+    if s >= 80: return (str(int(round(s))), "A")
+    if s >= 65: return (str(int(round(s))), "B")
+    if s >= 50: return (str(int(round(s))), "C")
+    return (str(int(round(s))), "SKIP")
 
-def build_entry_msg(trade: Trade, event: str) -> str:
-    score = trade.buyScore if trade.side == "BUY" else trade.sellScore
-    return (
-        f"📊 TRADE ALERT\n\n"
-        f"{trade.symbol} — {trade.side}\n"
-        f"Type: {event}\n"
-        f"TF: {trade.tf}\n\n"
-        f"Entry: {trade.entry_price}\n"
-        f"SL: {trade.sl}\n"
-        f"TP: {trade.tp}\n"
-        f"Adds: {trade.adds}\n"
-        f"Score: {score} ({grade(score)})\n"
-        f"W/L: {state.get('wins',0)}/{state.get('losses',0)}\n"
-        f"TradeID: {trade.trade_id}"
-    )
+def normalize_side(event: str, side_plot: float | None):
+    e = (event or "").upper()
+    if "BUY" in e:
+        return "BUY"
+    if "SELL" in e:
+        return "SELL"
+    # fallback from plot_5 (posDir): 1 buy, -1 sell
+    if side_plot is not None:
+        if side_plot > 0:
+            return "BUY"
+        if side_plot < 0:
+            return "SELL"
+    return "N/A"
 
-def build_scale_msg(trade: Trade, event: str) -> str:
-    return (
-        f"➕ SCALE\n\n"
-        f"{trade.symbol} — {trade.side}\n"
-        f"Type: {event}\n"
-        f"TF: {trade.tf}\n\n"
-        f"Price: {fnum(trade.entry_price)}\n"
-        f"Adds: {trade.adds}\n"
-        f"W/L: {state.get('wins',0)}/{state.get('losses',0)}\n"
-        f"TradeID: {trade.trade_id}"
-    )
-
-def build_exit_msg(trade: Trade) -> str:
-    icon = "✅" if trade.result == "WIN" else "❌"
-    return (
-        f"🏁 EXIT ({trade.exit_event})\n\n"
-        f"{trade.symbol} — {trade.side}\n"
-        f"TF: {trade.tf}\n\n"
-        f"Entry: {trade.entry_price}\n"
-        f"Exit: {trade.exit_price}\n"
-        f"Result: {trade.result} {icon}\n"
-        f"W/L: {state.get('wins',0)}/{state.get('losses',0)}\n"
-        f"TradeID: {trade.trade_id}"
-    )
-
-# ─────────────────────────────────────────────────────────────
-# Flask webhook
-# ─────────────────────────────────────────────────────────────
-app = Flask(__name__)
-load_state()
-
-@app.post("/webhook")
-def webhook():
-    payload = request.get_json(force=True, silent=True) or {}
-    event = str(payload.get("event", "")).upper().strip()
-
-    # Normalize side based on event name
-    if "BUY" in event:
-        side = "BUY"
-    elif "SELL" in event:
-        side = "SELL"
-    else:
-        # TRAIL_LONG / TRAIL_SHORT still implies side by your system:
-        # If you want, we can send explicit side from Pine.
-        side = "BUY" if event == "TRAIL_LONG" else "SELL" if event == "TRAIL_SHORT" else "N/A"
-
-    price = fnum(payload.get("price"))
-
-    # ENTRY
-    if event in ("ENTRY_BUY", "ENTRY_SELL"):
-        trade = open_trade(payload, side)
-        send_telegram(build_entry_msg(trade, "ENTRY"))
-        return jsonify({"ok": True, "trade_id": trade.trade_id})
-
-    # SCALE
-    if event in ("SCALE_BUY", "SCALE_SELL"):
-        trade = get_open_trade(payload, side)
-        if not trade:
-            # no open trade found -> ignore or open new (we ignore to avoid bad linking)
-            return jsonify({"ok": False, "error": "No open trade to scale"}), 400
-        trade.adds = snum(payload.get("adds")) or (trade.adds + 1)
-        # update scores / sl/tp if provided
-        trade.sl = fnum(payload.get("sl")) or trade.sl
-        trade.tp = fnum(payload.get("tp")) or trade.tp
-        trade.buyScore = fnum(payload.get("buyScore")) or trade.buyScore
-        trade.sellScore = fnum(payload.get("sellScore")) or trade.sellScore
-        update_open_trade(trade)
-        send_telegram(build_scale_msg(trade, "SCALE"))
-        return jsonify({"ok": True, "trade_id": trade.trade_id})
-
-    # TP1 (optional event)
-    if event in ("TP1_BUY", "TP1_SELL"):
-        trade = get_open_trade(payload, side)
-        if not trade:
-            return jsonify({"ok": False, "error": "No open trade for TP1"}), 400
-        trade.tp1_hit = True
-        trade.be_armed = True
-        trade.trail_active = True
-        update_open_trade(trade)
-        send_telegram(f"🎯 TP1 HIT\n{trade.symbol} {trade.side}\nTradeID: {trade.trade_id}\nBE armed ✅ Trail on ✅")
-        return jsonify({"ok": True, "trade_id": trade.trade_id})
-
-    # TRAIL EXIT (we treat as final exit)
-    if event in ("TRAIL_LONG", "TRAIL_SHORT"):
-        # infer side for trail events:
-        trail_side = "BUY" if event == "TRAIL_LONG" else "SELL"
-        trade = get_open_trade(payload, trail_side)
-        if not trade:
-            return jsonify({"ok": False, "error": "No open trade to exit"}), 400
-        if price is None:
-            return jsonify({"ok": False, "error": "Missing price for exit"}), 400
-        trade = close_trade(trade, event, price)
-        send_telegram(build_exit_msg(trade))
-        return jsonify({"ok": True, "trade_id": trade.trade_id, "result": trade.result})
-
-    return jsonify({"ok": False, "error": f"Unknown event: {event}"}), 400
-
+def fmt_price(x):
+    return "N/A" if x is None else f"{x:.2f}"
 
 @app.get("/")
 def home():
     return "OK"
 
+@app.post("/webhook")
+def webhook():
+    # Ensure JSON
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"ok": False, "error": "Non-JSON body"}), 400
+
+    event  = str(data.get("event", "")).strip()
+    symbol = str(data.get("symbol", "N/A")).strip()
+    tf     = str(data.get("tf", "N/A")).strip()
+
+    price = to_float(data.get("price"))
+    sl    = to_float(data.get("sl"))
+    tp    = to_float(data.get("tp"))
+    adds  = to_float(data.get("adds"))
+    side_plot = to_float(data.get("side"))
+
+    buyScore  = to_float(data.get("buyScore"))
+    sellScore = to_float(data.get("sellScore"))
+
+    side = normalize_side(event, side_plot)
+
+    # choose the right score by side
+    score_val = buyScore if side == "BUY" else sellScore if side == "SELL" else None
+    score_num, score_grade = grade(score_val)
+
+    # Init stats
+    if symbol not in state["stats"]:
+        state["stats"][symbol] = {"wins": 0, "losses": 0}
+
+    # Store entries so we can label TRAIL as win/loss later
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Entry or Scale events
+    if event.upper().startswith("ENTRY"):
+        state["last_entry"][symbol] = {
+            "side": side,
+            "entry": price,
+            "sl": sl,
+            "tp": tp,
+            "time": now
+        }
+
+        warning = ""
+        if side == "BUY" and tp is not None and price is not None and tp <= price:
+            warning = "\n⚠️ TP should be ABOVE entry for BUY"
+        if side == "SELL" and tp is not None and price is not None and tp >= price:
+            warning = "\n⚠️ TP should be BELOW entry for SELL"
+
+        text = (
+            f"📊 TRADE ALERT\n\n"
+            f"{symbol} — {side}\n"
+            f"Type: ENTRY\n"
+            f"TF: {tf}\n\n"
+            f"Entry: {fmt_price(price)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP: {fmt_price(tp)}\n"
+            f"Adds: {int(adds) if adds is not None else 0}\n"
+            f"Score: {score_num} ({score_grade})\n"
+            f"W/L: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}"
+            f"{warning}"
+        )
+        send_telegram(text)
+        return jsonify({"ok": True})
+
+    if event.upper().startswith("SCALE"):
+        text = (
+            f"📈 SCALE ALERT\n\n"
+            f"{symbol} — {side}\n"
+            f"Type: SCALE\n"
+            f"TF: {tf}\n\n"
+            f"Price: {fmt_price(price)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP: {fmt_price(tp)}\n"
+            f"Adds: {int(adds) if adds is not None else 0}\n"
+            f"Score: {score_num} ({score_grade})\n"
+            f"W/L: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}"
+        )
+        send_telegram(text)
+        return jsonify({"ok": True})
+
+    # Trail exit = close trade + update W/L
+    if event.upper().startswith("TRAIL"):
+        last = state["last_entry"].get(symbol)
+        outcome = "N/A"
+
+        if last and last.get("entry") is not None and price is not None:
+            entry = float(last["entry"])
+            last_side = last.get("side", "N/A")
+
+            if last_side == "BUY":
+                win = price > entry
+            elif last_side == "SELL":
+                win = price < entry
+            else:
+                win = None
+
+            if win is True:
+                state["stats"][symbol]["wins"] += 1
+                outcome = "WIN ✅"
+            elif win is False:
+                state["stats"][symbol]["losses"] += 1
+                outcome = "LOSS ❌"
+
+        text = (
+            f"🏁 TRAIL EXIT\n\n"
+            f"{symbol} — {side}\n"
+            f"Type: TRAIL\n"
+            f"TF: {tf}\n\n"
+            f"Exit: {fmt_price(price)}\n"
+            f"Result: {outcome}\n"
+            f"W/L: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}"
+        )
+        send_telegram(text)
+        return jsonify({"ok": True})
+
+    # Unknown event fallback
+    send_telegram(f"⚠️ Unknown event\n{json.dumps(data, indent=2)}")
+    return jsonify({"ok": True})
+
+
 if __name__ == "__main__":
-    # Railway uses PORT env var
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
