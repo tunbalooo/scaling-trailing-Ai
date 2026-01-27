@@ -9,17 +9,12 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Optional behavior switches
 LEARNING_MODE = os.getenv("LEARNING_MODE", "0").strip() == "1"   # default OFF
 MIN_SCORE     = float(os.getenv("MIN_SCORE", "0").strip() or "0") # default 0
 
-# In-memory state (Railway restarts will reset this)
-state = {
-    "stats": {},            # symbol -> {"wins": int, "losses": int}
-    "open_trade": {},       # symbol -> trade_id
-    "trades": {},           # trade_id -> trade dict
-    "learn": {}             # symbol -> side -> bucket -> {"w":int,"l":int}
-}
+# ✅ ADD: BE / rounding tolerance (set by tick size)
+DEFAULT_TICK = float(os.getenv("DEFAULT_TICK", "0.25"))  # NQ tick default
+BE_EPS_TICKS = float(os.getenv("BE_EPS_TICKS", "1"))     # treat within 1 tick as BE
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -58,49 +53,43 @@ def grade(score: float | None):
     if s >= 50: return (str(int(round(s))), "C")
     return (str(int(round(s))), "SKIP")
 
-# --- Event parsing (supports your explicit event strings) ---
 def normalize_event(event: str):
     e = (event or "").strip().upper().replace(" ", "_")
-    # common variants
     e = e.replace("__", "_")
     return e
 
-def side_from_event(e: str):
-    # Explicit mapping for your preferred events
+def side_from_payload(data, e: str):
+    # ✅ prefer explicit side field (from new Pine JSON)
+    side = str(data.get("side", "")).strip().upper()
+    if side in ("BUY", "SELL"):
+        return side
+
+    # fallback to old event parsing
     if e.endswith("_BUY") or "_BUY" in e:
         return "BUY"
     if e.endswith("_SELL") or "_SELL" in e:
         return "SELL"
-    # TRAIL_EXIT_LONG/SHORT mapping
     if "TRAIL_EXIT_LONG" in e:
         return "BUY"
     if "TRAIL_EXIT_SHORT" in e:
         return "SELL"
     return "N/A"
 
-def is_entry(e: str): return e.startswith("ENTRY")
-def is_scale(e: str): return e.startswith("SCALE")
-def is_trail(e: str): return e.startswith("TRAIL")
+def is_entry(e: str): return e == "ENTRY" or e.startswith("ENTRY")
+def is_scale(e: str): return e == "SCALE" or e.startswith("SCALE")
+def is_trail_exit(e: str): return "TRAIL_EXIT" in e
+def is_trail_update(e: str): return e == "TRAIL_UPDATE"
+def is_be_arm(e: str): return e == "BE_ARM"
 
-# --- Fix SL/TP mixups automatically (common when plots are mapped wrong) ---
 def auto_fix_sl_tp(side: str, price: float | None, sl: float | None, tp: float | None):
-    # If we don't have enough info, do nothing
     if side not in ("BUY", "SELL") or price is None or sl is None or tp is None:
         return sl, tp
-
-    # BUY: expected sl < price < tp
-    # If reversed (sl > price and tp < price), swap
     if side == "BUY" and sl > price and tp < price:
         return tp, sl
-
-    # SELL: expected tp < price < sl
-    # If reversed (sl < price and tp > price), swap
     if side == "SELL" and sl < price and tp > price:
         return tp, sl
-
     return sl, tp
 
-# --- Simple learning (optional) ---
 def score_bucket(score: float | None):
     if score is None:
         return None
@@ -123,39 +112,36 @@ def learn_record(symbol: str, side: str, score: float | None, win: bool):
         state["learn"][symbol][side][b]["l"] += 1
 
 def learn_should_send(symbol: str, side: str, score: float | None):
-    # Default: send everything
     if not LEARNING_MODE:
         return True
-
-    # Hard floor if you want it
     if score is not None and float(score) < MIN_SCORE:
         return False
-
-    # If we have learning stats, we can suppress SKIP bucket when it's losing a lot
     b = score_bucket(score)
     if b is None:
         return True
-
     data = state["learn"].get(symbol, {}).get(side, {}).get(b)
     if not data:
         return True
-
     w, l = data["w"], data["l"]
     total = w + l
     if total < 10:
-        return True  # not enough history yet
-
+        return True
     winrate = w / total
-    # Example rule: suppress SKIP/C if winrate is poor
     if b in ("SKIP", "C") and winrate < 0.40:
         return False
-
     return True
 
-# --- Trade ID ---
-def new_trade_id(symbol: str):
-    ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    return f"{symbol}-{ts}"
+# In-memory state
+state = {
+    "stats": {},
+    "open_trade": {},   # symbol -> trade_id
+    "trades": {},       # trade_id -> trade dict
+    "learn": {}
+}
+
+def be_is_hit(entry: float, exit_price: float, tick=DEFAULT_TICK):
+    eps = tick * BE_EPS_TICKS
+    return abs(exit_price - entry) <= eps
 
 @app.get("/")
 def home():
@@ -181,25 +167,25 @@ def webhook():
     buyScore  = to_float(data.get("buyScore"))
     sellScore = to_float(data.get("sellScore"))
 
-    side = side_from_event(e)
+    side = side_from_payload(data, e)
 
-    # choose the right score by side
     score_val = buyScore if side == "BUY" else sellScore if side == "SELL" else None
     score_num, score_grade = grade(score_val)
 
-    # Init stats
     if symbol not in state["stats"]:
-        state["stats"][symbol] = {"wins": 0, "losses": 0}
+        state["stats"][symbol] = {"wins": 0, "losses": 0, "be": 0}
 
-    # Auto-fix common SL/TP swap issues
+    # auto-fix if needed
     sl, tp = auto_fix_sl_tp(side, price, sl, tp)
+
+    # ✅ ADD: accept Pine trade_id when provided
+    incoming_trade_id = str(data.get("trade_id", "")).strip() or None
 
     # ---------------------------------------------------------
     # ENTRY
     # ---------------------------------------------------------
     if is_entry(e):
-        # create a new trade_id
-        trade_id = new_trade_id(symbol)
+        trade_id = incoming_trade_id or f"{symbol}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         state["open_trade"][symbol] = trade_id
 
         state["trades"][trade_id] = {
@@ -212,20 +198,20 @@ def webhook():
             "tp": tp,
             "adds": int(adds) if adds is not None else 0,
             "score": score_val,
+            "be_armed": False,
             "opened_at": now_str(),
             "closed_at": None,
             "exit": None,
-            "result": None
+            "result": None,
+            "exit_reason": None
         }
 
-        # sanity warnings
         warning = ""
         if side == "BUY" and tp is not None and price is not None and tp <= price:
             warning = "\n⚠️ TP should be ABOVE entry for BUY"
         if side == "SELL" and tp is not None and price is not None and tp >= price:
             warning = "\n⚠️ TP should be BELOW entry for SELL"
 
-        # learning filter (optional)
         if learn_should_send(symbol, side, score_val):
             text = (
                 f"📊 TRADE ALERT\n\n"
@@ -238,7 +224,7 @@ def webhook():
                 f"TP: {fmt_price(tp)}\n"
                 f"Adds: {int(adds) if adds is not None else 0}\n"
                 f"Score: {score_num} ({score_grade})\n"
-                f"W/L: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}"
+                f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
                 f"{warning}"
             )
             send_telegram(text)
@@ -249,9 +235,8 @@ def webhook():
     # SCALE
     # ---------------------------------------------------------
     if is_scale(e):
-        trade_id = state["open_trade"].get(symbol)
+        trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         if trade_id and trade_id in state["trades"]:
-            # attach scale to current trade
             state["trades"][trade_id]["adds"] = int(adds) if adds is not None else state["trades"][trade_id].get("adds", 0)
 
             if learn_should_send(symbol, side, score_val):
@@ -266,71 +251,115 @@ def webhook():
                     f"TP: {fmt_price(tp)}\n"
                     f"Adds: {int(adds) if adds is not None else 0}\n"
                     f"Score: {score_num} ({score_grade})\n"
-                    f"W/L: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}"
+                    f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
                 )
                 send_telegram(text)
 
             return jsonify({"ok": True, "trade_id": trade_id})
 
-        # If scale arrives without an open trade, still notify as warning
         send_telegram(f"⚠️ SCALE received but no open trade found.\n{json.dumps(data, indent=2)}")
         return jsonify({"ok": True, "warning": "scale_without_open_trade"})
 
     # ---------------------------------------------------------
-    # TRAIL EXIT
+    # BE_ARM
     # ---------------------------------------------------------
-    if is_trail(e):
-        trade_id = state["open_trade"].get(symbol)
-        last = state["trades"].get(trade_id) if trade_id else None
+    if is_be_arm(e):
+        trade_id = incoming_trade_id or state["open_trade"].get(symbol)
+        t = state["trades"].get(trade_id) if trade_id else None
+        if t:
+            t["be_armed"] = True
+            if sl is not None:
+                t["sl"] = sl
+            text = (
+                f"🟦 BREAK-EVEN ARMED\n\n"
+                f"{symbol} — {t.get('side','N/A')}\n"
+                f"TF: {tf}\n"
+                f"TradeID: {trade_id}\n\n"
+                f"Entry: {fmt_price(t.get('entry'))}\n"
+                f"New SL (BE): {fmt_price(t.get('sl'))}\n"
+            )
+            send_telegram(text)
+            return jsonify({"ok": True, "trade_id": trade_id})
 
-        # IMPORTANT: show side from the linked entry (fixes N/A / wrong side)
-        display_side = last.get("side") if last and last.get("side") in ("BUY", "SELL") else side
+        send_telegram(f"⚠️ BE_ARM received but no open trade found.\n{json.dumps(data, indent=2)}")
+        return jsonify({"ok": True, "warning": "be_without_open_trade"})
 
-        outcome = "N/A"
-        win_bool = None
+    # ---------------------------------------------------------
+    # TRAIL_UPDATE (SL moved)
+    # ---------------------------------------------------------
+    if is_trail_update(e):
+        trade_id = incoming_trade_id or state["open_trade"].get(symbol)
+        t = state["trades"].get(trade_id) if trade_id else None
+        if t:
+            if sl is not None:
+                t["sl"] = sl
+            # optional: don't spam telegram for every trail update
+            return jsonify({"ok": True, "trade_id": trade_id})
+        return jsonify({"ok": True, "warning": "trail_update_without_trade"})
 
-        if last and last.get("entry") is not None and price is not None:
-            entry = float(last["entry"])
+    # ---------------------------------------------------------
+    # TRAIL EXIT (LONG/SHORT)
+    # ---------------------------------------------------------
+    if is_trail_exit(e):
+        trade_id = incoming_trade_id or state["open_trade"].get(symbol)
+        t = state["trades"].get(trade_id) if trade_id else None
 
+        if not t or t.get("entry") is None or price is None:
+            send_telegram(
+                f"🏁 TRAIL EXIT\n\n"
+                f"{symbol} — {side}\n"
+                f"Type: TRAIL\n"
+                f"TF: {tf}\n"
+                f"TradeID: {trade_id or 'N/A'}\n\n"
+                f"Exit: {fmt_price(price)}\n"
+                f"Result: N/A (no linked ENTRY)\n"
+                f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+            )
+            return jsonify({"ok": True, "trade_id": trade_id})
+
+        entry = float(t["entry"])
+        display_side = t.get("side", side)
+
+        # ✅ classify: WIN / BE / LOSS
+        if be_is_hit(entry, float(price), DEFAULT_TICK):
+            state["stats"][symbol]["be"] += 1
+            outcome = "BREAKEVEN 🟦"
+            win_bool = None
+        else:
             if display_side == "BUY":
-                win_bool = price > entry
-            elif display_side == "SELL":
-                win_bool = price < entry
+                win_bool = float(price) > entry
+            else:
+                win_bool = float(price) < entry
 
-            if win_bool is True:
+            if win_bool:
                 state["stats"][symbol]["wins"] += 1
                 outcome = "WIN ✅"
-            elif win_bool is False:
+            else:
                 state["stats"][symbol]["losses"] += 1
                 outcome = "LOSS ❌"
 
-            # close trade
-            last["closed_at"] = now_str()
-            last["exit"] = price
-            last["result"] = outcome
+        t["closed_at"] = now_str()
+        t["exit"] = float(price)
+        t["result"] = outcome
+        t["exit_reason"] = e
 
-            # learning record (optional)
-            if win_bool is not None:
-                learn_record(symbol, display_side, last.get("score"), win_bool)
+        if win_bool is not None:
+            learn_record(symbol, display_side, t.get("score"), win_bool)
 
-            # clear open trade
-            state["open_trade"].pop(symbol, None)
+        state["open_trade"].pop(symbol, None)
 
-        else:
-            # If we can't link it to a real entry, DO NOT pretend win/loss.
-            outcome = "N/A (no linked ENTRY)"
-
-        text = (
+        send_telegram(
             f"🏁 TRAIL EXIT\n\n"
             f"{symbol} — {display_side}\n"
             f"Type: TRAIL\n"
             f"TF: {tf}\n"
-            f"TradeID: {trade_id or 'N/A'}\n\n"
+            f"TradeID: {trade_id}\n\n"
+            f"Entry: {fmt_price(entry)}\n"
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
-            f"W/L: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}"
+            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
         )
-        send_telegram(text)
+
         return jsonify({"ok": True, "trade_id": trade_id})
 
     # ---------------------------------------------------------
