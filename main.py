@@ -87,6 +87,11 @@ def side_from_payload(data, e: str):
         return "SELL"
     return "N/A"
 
+# ✅ NEW: map LONG/SHORT to order type label
+def stop_order_label(direction: str):
+    # direction = "LONG" or "SHORT"
+    return "BUY STOP" if direction == "LONG" else "SELL STOP"
+
 # ----- NEW EVENT HELPERS (scalping 1-6) -----
 def is_watch(e: str): return e in ("WATCH_LONG", "WATCH_SHORT")
 def is_ready(e: str): return e in ("READY_LONG", "READY_SHORT")
@@ -175,6 +180,37 @@ def be_is_hit(entry: float, exit_price: float, symbol: str):
     eps = tick * BE_EPS_TICKS
     return abs(exit_price - entry) <= eps
 
+# ✅ NEW: if ENTRY was missed (TV alert downtime), create a "stub trade"
+def ensure_stub_trade(trade_id: str, symbol: str, side: str, tf: str,
+                      entry: float | None, sl: float | None, tp: float | None,
+                      be_tr: float | None, contracts: int | None, score_val: float | None):
+    if not trade_id:
+        return None
+    t = state["trades"].get(trade_id)
+    if t:
+        return t
+    state["open_trade"][symbol] = trade_id
+    state["trades"][trade_id] = {
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "side": side,
+        "tf": tf,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "be_trigger": be_tr,
+        "contracts": contracts,
+        "adds": 0,
+        "score": score_val,
+        "be_armed": False,
+        "opened_at": now_str(),
+        "closed_at": None,
+        "exit": None,
+        "result": None,
+        "exit_reason": None
+    }
+    return state["trades"][trade_id]
+
 @app.get("/")
 def home():
     return "OK"
@@ -218,6 +254,7 @@ def webhook():
         score_val = buyScore if side == "BUY" else sellScore if side == "SELL" else None
 
     score_num, score_grade = grade(score_val)
+    quality = score_grade  # ✅ A / B / C / SKIP / N/A
 
     if symbol not in state["stats"]:
         state["stats"][symbol] = {"wins": 0, "losses": 0, "be": 0}
@@ -237,40 +274,43 @@ def webhook():
     incoming_trade_id = str(data.get("trade_id", "")).strip() or None
 
     # ---------------------------------------------------------
-    # 1) WATCH
+    # 1) WATCH  (updated message)
     # ---------------------------------------------------------
     if is_watch(e):
         watch_level = to_float(data.get("watch_level"))
         w_price     = to_float(data.get("w_price"))
         buf_pts     = to_float(data.get("buffer_points"))
         direction = "LONG" if e.endswith("_LONG") else "SHORT"
+        order_type = stop_order_label(direction)
 
         msg = (
-            f"👀 WATCH {direction}\n"
+            f"👀 WATCH {order_type}\n"
             f"{symbol} | TF {tf}\n"
-            f"Level: {fmt_price(watch_level)}\n"
-            f"Price: {fmt_price(w_price)}\n"
-            f"Buffer: {fmt_price(buf_pts)}"
+            f"Entry: {fmt_price(watch_level)}\n"
+            f"Current Price: {fmt_price(w_price)}\n"
+            f"Buffer: {fmt_price(buf_pts)}\n"
+            f"Quality: {score_num} ({quality})"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
 
     # ---------------------------------------------------------
-    # 2) READY
+    # 2) READY  (changed to PLACE BUY/SELL STOP)
     # ---------------------------------------------------------
     if is_ready(e):
         watch_level = to_float(data.get("watch_level"))
         w_price     = to_float(data.get("w_price"))
         buf_pts     = to_float(data.get("buffer_points"))
         direction = "LONG" if e.endswith("_LONG") else "SHORT"
+        order_type = stop_order_label(direction)
 
         msg = (
-            f"⚠️ READY {direction}\n"
+            f"🎯 PLACE {order_type}\n"
             f"{symbol} | TF {tf}\n"
-            f"Level: {fmt_price(watch_level)}\n"
-            f"Price: {fmt_price(w_price)}\n"
+            f"Entry: {fmt_price(watch_level)}\n"
+            f"Current Price: {fmt_price(w_price)}\n"
             f"Buffer: {fmt_price(buf_pts)}\n"
-            f"Prepare to execute…"
+            f"Quality: {score_num} ({quality})"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
@@ -317,7 +357,7 @@ def webhook():
                 f"SL: {fmt_price(sl)}\n"
                 f"TP1: {fmt_price(tp)}\n"
                 f"BE Trigger: {fmt_price(be_tr)}\n"
-                f"Score: {score_num} ({score_grade})\n"
+                f"Quality: {score_num} ({quality})\n"
                 f"Contracts: {contracts if contracts is not None else 'N/A'}\n"
                 f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
                 f"{warning}"
@@ -327,24 +367,28 @@ def webhook():
         return jsonify({"ok": True, "trade_id": trade_id})
 
     # ---------------------------------------------------------
-    # 4) BREAK_EVEN (your Pine sends BREAK_EVEN when BE trigger hit)
+    # 4) BREAK_EVEN
     # ---------------------------------------------------------
     if is_break_even(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         t = state["trades"].get(trade_id) if trade_id else None
+
+        # ✅ fallback: create stub trade if ENTRY was missed
+        if not t and incoming_trade_id:
+            t = ensure_stub_trade(incoming_trade_id, symbol, side, tf, entry, sl, tp, be_tr, contracts, score_val)
+
         if t:
             t["be_armed"] = True
-            # We DON'T change SL here because Pine can't know your manual move.
-            # This is a management instruction alert.
             send_telegram(
                 f"🔄 MOVE SL TO BREAK-EVEN\n\n"
                 f"{symbol} — {t.get('side','N/A')} | TF {tf}\n"
-                f"TradeID: {trade_id}\n\n"
+                f"TradeID: {t.get('trade_id')}\n\n"
                 f"Entry: {fmt_price(t.get('entry'))}\n"
                 f"Current Price: {fmt_price(price)}\n"
-                f"BE Trigger: {fmt_price(t.get('be_trigger'))}"
+                f"BE Trigger: {fmt_price(t.get('be_trigger'))}\n"
+                f"Quality: {score_num} ({quality})"
             )
-            return jsonify({"ok": True, "trade_id": trade_id})
+            return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
         send_telegram(f"⚠️ BREAK_EVEN received but no open trade found.\n{json.dumps(data, indent=2)}")
         return jsonify({"ok": True, "warning": "be_without_open_trade"})
@@ -355,21 +399,27 @@ def webhook():
     if is_trim(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         t = state["trades"].get(trade_id) if trade_id else None
+
+        # ✅ fallback: create stub trade if ENTRY was missed
+        if not t and incoming_trade_id:
+            t = ensure_stub_trade(incoming_trade_id, symbol, side, tf, entry, sl, tp, be_tr, contracts, score_val)
+
         if t:
             send_telegram(
                 f"💰 TRIM HIT\n\n"
                 f"{symbol} — {t.get('side','N/A')} | TF {tf}\n"
-                f"TradeID: {trade_id}\n\n"
+                f"TradeID: {t.get('trade_id')}\n\n"
                 f"TP1 reached: {fmt_price(t.get('tp'))}\n"
-                f"Current Price: {fmt_price(price)}"
+                f"Current Price: {fmt_price(price)}\n"
+                f"Quality: {score_num} ({quality})"
             )
-            return jsonify({"ok": True, "trade_id": trade_id})
+            return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
         send_telegram(f"⚠️ TRIM received but no open trade found.\n{json.dumps(data, indent=2)}")
         return jsonify({"ok": True, "warning": "trim_without_open_trade"})
 
     # ---------------------------------------------------------
-    # 6) STOP_HIT  (close trade + classify LOSS / BE / WIN if you want)
+    # 6) STOP_HIT
     # ---------------------------------------------------------
     if is_stop_hit(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
@@ -382,7 +432,8 @@ def webhook():
                 f"TF: {tf}\n"
                 f"TradeID: {trade_id or 'N/A'}\n\n"
                 f"Exit: {fmt_price(price)}\n"
-                f"Result: N/A (no linked ENTRY)"
+                f"Result: N/A (no linked ENTRY)\n"
+                f"Quality: {score_num} ({quality})"
             )
             return jsonify({"ok": True, "trade_id": trade_id})
 
@@ -418,16 +469,21 @@ def webhook():
             f"Entry: {fmt_price(entry_px)}\n"
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
+            f"Quality: {score_num} ({quality})\n"
             f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
         )
         return jsonify({"ok": True, "trade_id": trade_id})
 
     # ---------------------------------------------------------
-    # Optional: EXIT_TREND_FLIP (close trade with win/loss by entry vs exit)
+    # EXIT_TREND_FLIP (close trade)
     # ---------------------------------------------------------
     if is_exit_flip(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         t = state["trades"].get(trade_id) if trade_id else None
+
+        # ✅ fallback: create stub trade if ENTRY was missed
+        if not t and incoming_trade_id:
+            t = ensure_stub_trade(incoming_trade_id, symbol, side, tf, entry, sl, tp, be_tr, contracts, score_val)
 
         if not t or t.get("entry") is None or price is None:
             send_telegram(f"🏁 EXIT (Trend Flip) but no linked trade.\n{json.dumps(data, indent=2)}")
@@ -468,13 +524,14 @@ def webhook():
             f"🏁 EXIT (Trend Flip)\n\n"
             f"{symbol} — {display_side}\n"
             f"TF: {tf}\n"
-            f"TradeID: {trade_id}\n\n"
+            f"TradeID: {t.get('trade_id')}\n\n"
             f"Entry: {fmt_price(entry_px)}\n"
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
+            f"Quality: {score_num} ({quality})\n"
             f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
         )
-        return jsonify({"ok": True, "trade_id": trade_id})
+        return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
     # ---------------------------------------------------------
     # Keep your existing SCALE / TRAIL logic (backward compatibility)
@@ -493,7 +550,7 @@ def webhook():
                     f"SL: {fmt_price(sl)}\n"
                     f"TP: {fmt_price(tp)}\n"
                     f"Adds: {int(adds) if adds is not None else 0}\n"
-                    f"Score: {score_num} ({score_grade})\n"
+                    f"Quality: {score_num} ({quality})\n"
                     f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
                 )
                 send_telegram(text)
@@ -523,6 +580,7 @@ def webhook():
                 f"TradeID: {trade_id or 'N/A'}\n\n"
                 f"Exit: {fmt_price(price)}\n"
                 f"Result: N/A (no linked ENTRY)\n"
+                f"Quality: {score_num} ({quality})\n"
                 f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
             )
             return jsonify({"ok": True, "trade_id": trade_id})
@@ -565,6 +623,7 @@ def webhook():
             f"Entry: {fmt_price(entry_px)}\n"
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
+            f"Quality: {score_num} ({quality})\n"
             f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
         )
         return jsonify({"ok": True, "trade_id": trade_id})
