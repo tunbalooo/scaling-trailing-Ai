@@ -101,6 +101,10 @@ def is_trim(e: str): return e == "TRIM"
 def is_stop_hit(e: str): return e == "STOP_HIT"
 def is_exit_flip(e: str): return e == "EXIT_TREND_FLIP"
 
+# ✅ NEW: Script B events
+def is_box_created(e: str): return e == "BOX_CREATED"
+def is_pullback(e: str): return e == "PULLBACK_TO_BOX"
+
 # keep your old ones too (backwards compatible)
 def is_scale(e: str): return e == "SCALE" or e.startswith("SCALE")
 def is_trail_exit(e: str): return "TRAIL_EXIT" in e
@@ -272,6 +276,34 @@ def webhook():
     sl, tp = auto_fix_sl_tp(side, entry, sl, tp)
 
     incoming_trade_id = str(data.get("trade_id", "")).strip() or None
+
+    # ---------------------------------------------------------
+    # BOX_CREATED (Script B)
+    # ---------------------------------------------------------
+    if is_box_created(e):
+        side_bc = side_from_payload(data, e)
+        msg = (
+            f"🧱 BOX CREATED\n"
+            f"{symbol} | TF {tf}\n"
+            f"Side: {side_bc}\n"
+            f"Current Price: {fmt_price(price)}"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------
+    # PULLBACK_TO_BOX (Script B)
+    # ---------------------------------------------------------
+    if is_pullback(e):
+        side_pb = side_from_payload(data, e)
+        msg = (
+            f"↩️ PULLBACK TO BOX\n"
+            f"{symbol} | TF {tf}\n"
+            f"Side: {side_pb}\n"
+            f"Current Price: {fmt_price(price)}"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
 
     # ---------------------------------------------------------
     # 1) WATCH  (updated message)
