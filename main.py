@@ -89,19 +89,18 @@ def side_from_payload(data, e: str):
 
 # ✅ NEW: map LONG/SHORT to order type label
 def stop_order_label(direction: str):
-    # direction = "LONG" or "SHORT"
     return "BUY STOP" if direction == "LONG" else "SELL STOP"
 
 # ----- NEW EVENT HELPERS (scalping 1-6) -----
 def is_watch(e: str): return e in ("WATCH_LONG", "WATCH_SHORT")
 def is_ready(e: str): return e in ("READY_LONG", "READY_SHORT")
 def is_entry(e: str): return e in ("ENTRY", "ENTRY_BUY", "ENTRY_SELL") or e.startswith("ENTRY")
-def is_break_even(e: str): return e in ("BREAK_EVEN", "BE_ARM")  # accept both
+def is_break_even(e: str): return e in ("BREAK_EVEN", "BE_ARM")
 def is_trim(e: str): return e == "TRIM"
 def is_stop_hit(e: str): return e == "STOP_HIT"
 def is_exit_flip(e: str): return e == "EXIT_TREND_FLIP"
 
-# ✅ NEW: Script B events
+# ✅ Script B events
 def is_box_created(e: str): return e == "BOX_CREATED"
 def is_pullback(e: str): return e == "PULLBACK_TO_BOX"
 
@@ -171,10 +170,8 @@ state = {
 
 def tick_by_symbol(symbol: str):
     s = (symbol or "").upper()
-    # NQ / MNQ
     if "NQ" in s:
         return 0.25
-    # Micro Silver is often "SIL" (sometimes "SIL1!" on TV)
     if "SIL" in s:
         return 0.005
     return DEFAULT_TICK
@@ -184,7 +181,7 @@ def be_is_hit(entry: float, exit_price: float, symbol: str):
     eps = tick * BE_EPS_TICKS
     return abs(exit_price - entry) <= eps
 
-# ✅ NEW: if ENTRY was missed (TV alert downtime), create a "stub trade"
+# ✅ if ENTRY was missed, create a stub trade
 def ensure_stub_trade(trade_id: str, symbol: str, side: str, tf: str,
                       entry: float | None, sl: float | None, tp: float | None,
                       be_tr: float | None, contracts: int | None, score_val: float | None):
@@ -231,18 +228,18 @@ def webhook():
     symbol = str(data.get("symbol", "N/A")).strip()
     tf     = str(data.get("tf", "N/A")).strip()
 
-    # Pine sends strings sometimes; we parse safely
     price = to_float(data.get("price"))
 
-    # NEW Pine fields (scalper)
+    # NEW Pine fields
     entry = to_float(data.get("entry"))
     sl    = to_float(data.get("sl"))
-    tp1   = to_float(data.get("tp1"))            # new target field
-    be_tr = to_float(data.get("be_trigger"))     # break-even trigger level
+    tp1   = to_float(data.get("tp1"))
+    be_tr = to_float(data.get("be_trigger"))
     score = to_float(data.get("score"))
     contracts = to_int(data.get("contracts"))
+    setup = str(data.get("setup", "N/A")).strip()
 
-    # Old fields (keep backward compatibility)
+    # Old fields
     tp_old = to_float(data.get("tp"))
     adds   = to_float(data.get("adds"))
     buyScore  = to_float(data.get("buyScore"))
@@ -250,63 +247,65 @@ def webhook():
 
     side = side_from_payload(data, e)
 
-    # Choose a "score" value:
-    # 1) new Pine "score"
-    # 2) old buyScore/sellScore
     score_val = score
     if score_val is None:
         score_val = buyScore if side == "BUY" else sellScore if side == "SELL" else None
 
     score_num, score_grade = grade(score_val)
-    quality = score_grade  # ✅ A / B / C / SKIP / N/A
+    quality = score_grade
 
     if symbol not in state["stats"]:
         state["stats"][symbol] = {"wins": 0, "losses": 0, "be": 0}
 
-    # Choose tp:
-    # 1) tp1 from scalper
-    # 2) old tp
     tp = tp1 if tp1 is not None else tp_old
 
-    # If ENTRY came without "entry", use "price" as entry
     if entry is None and is_entry(e):
         entry = price
 
-    # auto-fix if needed
     sl, tp = auto_fix_sl_tp(side, entry, sl, tp)
 
     incoming_trade_id = str(data.get("trade_id", "")).strip() or None
 
     # ---------------------------------------------------------
-    # BOX_CREATED (Script B)
+    # BOX_CREATED
     # ---------------------------------------------------------
     if is_box_created(e):
         side_bc = side_from_payload(data, e)
         msg = (
-            f"🧱 BOX CREATED\n"
+            f"🧱 SETUP DETECTED\n\n"
             f"{symbol} | TF {tf}\n"
             f"Side: {side_bc}\n"
-            f"Current Price: {fmt_price(price)}"
+            f"Entry: {fmt_price(entry)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP1: {fmt_price(tp)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
+            f"Setup: {setup}"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
 
     # ---------------------------------------------------------
-    # PULLBACK_TO_BOX (Script B)
+    # PULLBACK_TO_BOX
     # ---------------------------------------------------------
     if is_pullback(e):
         side_pb = side_from_payload(data, e)
         msg = (
-            f"↩️ PULLBACK TO BOX\n"
+            f"↩️ ENTRY TAPPED\n\n"
             f"{symbol} | TF {tf}\n"
             f"Side: {side_pb}\n"
-            f"Current Price: {fmt_price(price)}"
+            f"Entry: {fmt_price(entry)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP1: {fmt_price(tp)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
+            f"Setup: {setup}"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
 
     # ---------------------------------------------------------
-    # 1) WATCH  (updated message)
+    # WATCH
     # ---------------------------------------------------------
     if is_watch(e):
         watch_level = to_float(data.get("watch_level"))
@@ -327,7 +326,7 @@ def webhook():
         return jsonify({"ok": True})
 
     # ---------------------------------------------------------
-    # 2) READY  (changed to PLACE BUY/SELL STOP)
+    # READY
     # ---------------------------------------------------------
     if is_ready(e):
         watch_level = to_float(data.get("watch_level"))
@@ -348,7 +347,7 @@ def webhook():
         return jsonify({"ok": True})
 
     # ---------------------------------------------------------
-    # 3) ENTRY (ENTRY_BUY / ENTRY_SELL)
+    # ENTRY
     # ---------------------------------------------------------
     if is_entry(e):
         trade_id = incoming_trade_id or f"{symbol}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
@@ -361,9 +360,9 @@ def webhook():
             "tf": tf,
             "entry": entry,
             "sl": sl,
-            "tp": tp,                 # store tp1 as tp for compatibility
-            "be_trigger": be_tr,      # new
-            "contracts": contracts,   # new
+            "tp": tp,
+            "be_trigger": be_tr,
+            "contracts": contracts,
             "adds": int(adds) if adds is not None else 0,
             "score": score_val,
             "be_armed": False,
@@ -399,13 +398,12 @@ def webhook():
         return jsonify({"ok": True, "trade_id": trade_id})
 
     # ---------------------------------------------------------
-    # 4) BREAK_EVEN
+    # BREAK_EVEN
     # ---------------------------------------------------------
     if is_break_even(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         t = state["trades"].get(trade_id) if trade_id else None
 
-        # ✅ fallback: create stub trade if ENTRY was missed
         if not t and incoming_trade_id:
             t = ensure_stub_trade(incoming_trade_id, symbol, side, tf, entry, sl, tp, be_tr, contracts, score_val)
 
@@ -426,13 +424,12 @@ def webhook():
         return jsonify({"ok": True, "warning": "be_without_open_trade"})
 
     # ---------------------------------------------------------
-    # 5) TRIM
+    # TRIM
     # ---------------------------------------------------------
     if is_trim(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         t = state["trades"].get(trade_id) if trade_id else None
 
-        # ✅ fallback: create stub trade if ENTRY was missed
         if not t and incoming_trade_id:
             t = ensure_stub_trade(incoming_trade_id, symbol, side, tf, entry, sl, tp, be_tr, contracts, score_val)
 
@@ -451,7 +448,7 @@ def webhook():
         return jsonify({"ok": True, "warning": "trim_without_open_trade"})
 
     # ---------------------------------------------------------
-    # 6) STOP_HIT
+    # STOP_HIT
     # ---------------------------------------------------------
     if is_stop_hit(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
@@ -472,7 +469,6 @@ def webhook():
         entry_px = float(t["entry"])
         display_side = t.get("side", side)
 
-        # If BE armed and exit is within BE tolerance, count as BE
         if t.get("be_armed") and be_is_hit(entry_px, float(price), symbol):
             state["stats"][symbol]["be"] += 1
             outcome = "BREAKEVEN 🟦"
@@ -487,7 +483,6 @@ def webhook():
         t["result"] = outcome
         t["exit_reason"] = e
 
-        # learning record
         if win_bool is not None:
             learn_record(symbol, display_side, t.get("score"), win_bool)
 
@@ -507,13 +502,12 @@ def webhook():
         return jsonify({"ok": True, "trade_id": trade_id})
 
     # ---------------------------------------------------------
-    # EXIT_TREND_FLIP (close trade)
+    # EXIT_TREND_FLIP
     # ---------------------------------------------------------
     if is_exit_flip(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
         t = state["trades"].get(trade_id) if trade_id else None
 
-        # ✅ fallback: create stub trade if ENTRY was missed
         if not t and incoming_trade_id:
             t = ensure_stub_trade(incoming_trade_id, symbol, side, tf, entry, sl, tp, be_tr, contracts, score_val)
 
@@ -533,7 +527,6 @@ def webhook():
             state["stats"][symbol]["wins"] += 1
             outcome = "WIN ✅"
         else:
-            # treat as BE if within tolerance
             if be_is_hit(entry_px, float(price), symbol):
                 state["stats"][symbol]["be"] += 1
                 outcome = "BREAKEVEN 🟦"
@@ -566,7 +559,7 @@ def webhook():
         return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
     # ---------------------------------------------------------
-    # Keep your existing SCALE / TRAIL logic (backward compatibility)
+    # SCALE / TRAIL
     # ---------------------------------------------------------
     if is_scale(e):
         trade_id = incoming_trade_id or state["open_trade"].get(symbol)
