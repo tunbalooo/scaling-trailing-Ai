@@ -329,19 +329,18 @@ def webhook():
     # READY
     # ---------------------------------------------------------
     if is_ready(e):
-        watch_level = to_float(data.get("watch_level"))
-        w_price     = to_float(data.get("w_price"))
-        buf_pts     = to_float(data.get("buffer_points"))
         direction = "LONG" if e.endswith("_LONG") else "SHORT"
         order_type = stop_order_label(direction)
 
         msg = (
-            f"🎯 PLACE {order_type}\n"
+            f"🎯 {order_type} NEAR ENTRY\n\n"
             f"{symbol} | TF {tf}\n"
-            f"Entry: {fmt_price(watch_level)}\n"
-            f"Current Price: {fmt_price(w_price)}\n"
-            f"Buffer: {fmt_price(buf_pts)}\n"
-            f"Quality: {score_num} ({quality})"
+            f"Entry: {fmt_price(entry)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP1: {fmt_price(tp)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
+            f"Setup: {setup}"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
