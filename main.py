@@ -104,6 +104,13 @@ def is_exit_flip(e: str): return e == "EXIT_TREND_FLIP"
 def is_box_created(e: str): return e == "BOX_CREATED"
 def is_pullback(e: str): return e == "PULLBACK_TO_BOX"
 
+# ✅ CRT / Model 1 events
+def is_crt_ready(e: str): return e in ("CRT_READY", "CRT_RANGE_SET")
+def is_crt_buyside_sweep(e: str): return e in ("CRT_BUY_SIDE_SWEEP", "CRT_BUYSIDE_SWEEP", "BUY_SIDE_SWEEP")
+def is_crt_sellside_sweep(e: str): return e in ("CRT_SELL_SIDE_SWEEP", "CRT_SELLSIDE_SWEEP", "SELL_SIDE_SWEEP")
+def is_model1_ready(e: str): return e in ("MODEL_1_LONG_READY", "MODEL_1_SHORT_READY", "M1_LONG_READY", "M1_SHORT_READY")
+def is_model1_entry(e: str): return e in ("MODEL_1_LONG_ENTRY", "MODEL_1_SHORT_ENTRY", "M1_LONG_ENTRY", "M1_SHORT_ENTRY")
+
 # keep your old ones too (backwards compatible)
 def is_scale(e: str): return e == "SCALE" or e.startswith("SCALE")
 def is_trail_exit(e: str): return "TRAIL_EXIT" in e
@@ -181,6 +188,27 @@ def be_is_hit(entry: float, exit_price: float, symbol: str):
     eps = tick * BE_EPS_TICKS
     return abs(exit_price - entry) <= eps
 
+def stats_summary(symbol: str):
+    s = state["stats"].get(symbol, {"wins": 0, "losses": 0, "be": 0})
+    wins = s.get("wins", 0)
+    losses = s.get("losses", 0)
+    be = s.get("be", 0)
+    total = wins + losses + be
+    decided = wins + losses
+
+    win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
+    loss_rate = (losses / decided * 100.0) if decided > 0 else 0.0
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "be": be,
+        "total": total,
+        "decided": decided,
+        "win_rate": win_rate,
+        "loss_rate": loss_rate
+    }
+
 # ✅ if ENTRY was missed, create a stub trade
 def ensure_stub_trade(trade_id: str, symbol: str, side: str, tf: str,
                       entry: float | None, sl: float | None, tp: float | None,
@@ -239,6 +267,14 @@ def webhook():
     contracts = to_int(data.get("contracts"))
     setup = str(data.get("setup", "N/A")).strip()
 
+    # CRT / Model 1 fields
+    crt_high = to_float(data.get("crt_high"))
+    crt_low  = to_float(data.get("crt_low"))
+    crt_mid  = to_float(data.get("crt_mid"))
+    fvg_top  = to_float(data.get("fvg_top"))
+    fvg_bot  = to_float(data.get("fvg_bot"))
+    session_name = str(data.get("session_name", "CRT")).strip()
+
     # Old fields
     tp_old = to_float(data.get("tp"))
     adds   = to_float(data.get("adds"))
@@ -257,6 +293,8 @@ def webhook():
     if symbol not in state["stats"]:
         state["stats"][symbol] = {"wins": 0, "losses": 0, "be": 0}
 
+    stats = stats_summary(symbol)
+
     tp = tp1 if tp1 is not None else tp_old
 
     if entry is None and is_entry(e):
@@ -265,6 +303,114 @@ def webhook():
     sl, tp = auto_fix_sl_tp(side, entry, sl, tp)
 
     incoming_trade_id = str(data.get("trade_id", "")).strip() or None
+
+    # ---------------------------------------------------------
+    # CRT_READY
+    # ---------------------------------------------------------
+    if is_crt_ready(e):
+        msg = (
+            f"🧠 CRT RANGE SET\n\n"
+            f"{symbol} | TF {tf}\n"
+            f"Session: {session_name}\n"
+            f"CRT High: {fmt_price(crt_high)}\n"
+            f"CRT Low: {fmt_price(crt_low)}\n"
+            f"CRT Mid: {fmt_price(crt_mid)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Status: Waiting for liquidity sweep\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------
+    # CRT BUY-SIDE SWEEP
+    # ---------------------------------------------------------
+    if is_crt_buyside_sweep(e):
+        msg = (
+            f"🩸 BUY-SIDE LIQUIDITY TAKEN\n\n"
+            f"{symbol} | TF {tf}\n"
+            f"Session: {session_name}\n"
+            f"CRT High: {fmt_price(crt_high)}\n"
+            f"CRT Low: {fmt_price(crt_low)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Bias: LOOKING FOR SHORTS\n"
+            f"Status: Waiting for displacement + FVG\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------
+    # CRT SELL-SIDE SWEEP
+    # ---------------------------------------------------------
+    if is_crt_sellside_sweep(e):
+        msg = (
+            f"💧 SELL-SIDE LIQUIDITY TAKEN\n\n"
+            f"{symbol} | TF {tf}\n"
+            f"Session: {session_name}\n"
+            f"CRT High: {fmt_price(crt_high)}\n"
+            f"CRT Low: {fmt_price(crt_low)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Bias: LOOKING FOR LONGS\n"
+            f"Status: Waiting for displacement + FVG\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------
+    # MODEL 1 READY
+    # ---------------------------------------------------------
+    if is_model1_ready(e):
+        direction = "LONG" if "LONG" in e else "SHORT"
+
+        msg = (
+            f"🎯 MODEL 1 READY\n\n"
+            f"{symbol} | TF {tf}\n"
+            f"Session: {session_name}\n"
+            f"Direction: {direction}\n"
+            f"Entry: {fmt_price(entry)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP1: {fmt_price(tp)}\n"
+            f"FVG Top: {fmt_price(fvg_top)}\n"
+            f"FVG Bottom: {fmt_price(fvg_bot)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
+            f"Setup: {setup if setup != 'N/A' else 'CRT + True Model 1'}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
+
+    # ---------------------------------------------------------
+    # MODEL 1 ENTRY
+    # ---------------------------------------------------------
+    if is_model1_entry(e):
+        direction = "LONG" if "LONG" in e else "SHORT"
+        side_m1 = "BUY" if direction == "LONG" else "SELL"
+
+        msg = (
+            f"🚨 MODEL 1 ENTRY TRIGGERED\n\n"
+            f"{symbol} | TF {tf}\n"
+            f"Session: {session_name}\n"
+            f"Side: {side_m1}\n"
+            f"Entry: {fmt_price(entry)}\n"
+            f"SL: {fmt_price(sl)}\n"
+            f"TP1: {fmt_price(tp)}\n"
+            f"FVG Top: {fmt_price(fvg_top)}\n"
+            f"FVG Bottom: {fmt_price(fvg_bot)}\n"
+            f"Current Price: {fmt_price(price)}\n"
+            f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
+            f"Setup: {setup if setup != 'N/A' else 'CRT + True Model 1'}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
+        )
+        send_telegram(msg)
+        return jsonify({"ok": True})
 
     # ---------------------------------------------------------
     # BOX_CREATED
@@ -280,7 +426,9 @@ def webhook():
             f"TP1: {fmt_price(tp)}\n"
             f"Current Price: {fmt_price(price)}\n"
             f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
-            f"Setup: {setup}"
+            f"Setup: {setup}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
@@ -299,7 +447,9 @@ def webhook():
             f"TP1: {fmt_price(tp)}\n"
             f"Current Price: {fmt_price(price)}\n"
             f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
-            f"Setup: {setup}"
+            f"Setup: {setup}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
@@ -320,7 +470,9 @@ def webhook():
             f"Entry: {fmt_price(watch_level)}\n"
             f"Current Price: {fmt_price(w_price)}\n"
             f"Buffer: {fmt_price(buf_pts)}\n"
-            f"Quality: {score_num} ({quality})"
+            f"Quality: {score_num} ({quality})\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
@@ -340,7 +492,9 @@ def webhook():
             f"TP1: {fmt_price(tp)}\n"
             f"Current Price: {fmt_price(price)}\n"
             f"Confidence: {str(int(round(score_val))) + '%' if score_val is not None else 'N/A'}\n"
-            f"Setup: {setup}"
+            f"Setup: {setup}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         send_telegram(msg)
         return jsonify({"ok": True})
@@ -389,7 +543,9 @@ def webhook():
                 f"BE Trigger: {fmt_price(be_tr)}\n"
                 f"Quality: {score_num} ({quality})\n"
                 f"Contracts: {contracts if contracts is not None else 'N/A'}\n"
-                f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+                f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}\n"
+                f"Win Rate: {stats['win_rate']:.1f}%\n"
+                f"Loss Rate: {stats['loss_rate']:.1f}%"
                 f"{warning}"
             )
             send_telegram(text)
@@ -415,7 +571,9 @@ def webhook():
                 f"Entry: {fmt_price(t.get('entry'))}\n"
                 f"Current Price: {fmt_price(price)}\n"
                 f"BE Trigger: {fmt_price(t.get('be_trigger'))}\n"
-                f"Quality: {score_num} ({quality})"
+                f"Quality: {score_num} ({quality})\n"
+                f"Win Rate: {stats['win_rate']:.1f}%\n"
+                f"Loss Rate: {stats['loss_rate']:.1f}%"
             )
             return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
@@ -439,7 +597,9 @@ def webhook():
                 f"TradeID: {t.get('trade_id')}\n\n"
                 f"TP1 reached: {fmt_price(t.get('tp'))}\n"
                 f"Current Price: {fmt_price(price)}\n"
-                f"Quality: {score_num} ({quality})"
+                f"Quality: {score_num} ({quality})\n"
+                f"Win Rate: {stats['win_rate']:.1f}%\n"
+                f"Loss Rate: {stats['loss_rate']:.1f}%"
             )
             return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
@@ -461,7 +621,9 @@ def webhook():
                 f"TradeID: {trade_id or 'N/A'}\n\n"
                 f"Exit: {fmt_price(price)}\n"
                 f"Result: N/A (no linked ENTRY)\n"
-                f"Quality: {score_num} ({quality})"
+                f"Quality: {score_num} ({quality})\n"
+                f"Win Rate: {stats['win_rate']:.1f}%\n"
+                f"Loss Rate: {stats['loss_rate']:.1f}%"
             )
             return jsonify({"ok": True, "trade_id": trade_id})
 
@@ -486,6 +648,7 @@ def webhook():
             learn_record(symbol, display_side, t.get("score"), win_bool)
 
         state["open_trade"].pop(symbol, None)
+        stats = stats_summary(symbol)
 
         send_telegram(
             f"❌ STOP HIT\n\n"
@@ -496,7 +659,9 @@ def webhook():
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
             f"Quality: {score_num} ({quality})\n"
-            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         return jsonify({"ok": True, "trade_id": trade_id})
 
@@ -543,6 +708,7 @@ def webhook():
             learn_record(symbol, display_side, t.get("score"), win_bool)
 
         state["open_trade"].pop(symbol, None)
+        stats = stats_summary(symbol)
 
         send_telegram(
             f"🏁 EXIT (Trend Flip)\n\n"
@@ -553,7 +719,9 @@ def webhook():
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
             f"Quality: {score_num} ({quality})\n"
-            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         return jsonify({"ok": True, "trade_id": t.get("trade_id")})
 
@@ -575,7 +743,9 @@ def webhook():
                     f"TP: {fmt_price(tp)}\n"
                     f"Adds: {int(adds) if adds is not None else 0}\n"
                     f"Quality: {score_num} ({quality})\n"
-                    f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+                    f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}\n"
+                    f"Win Rate: {stats['win_rate']:.1f}%\n"
+                    f"Loss Rate: {stats['loss_rate']:.1f}%"
                 )
                 send_telegram(text)
             return jsonify({"ok": True, "trade_id": trade_id})
@@ -605,7 +775,9 @@ def webhook():
                 f"Exit: {fmt_price(price)}\n"
                 f"Result: N/A (no linked ENTRY)\n"
                 f"Quality: {score_num} ({quality})\n"
-                f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+                f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}\n"
+                f"Win Rate: {stats['win_rate']:.1f}%\n"
+                f"Loss Rate: {stats['loss_rate']:.1f}%"
             )
             return jsonify({"ok": True, "trade_id": trade_id})
 
@@ -638,6 +810,7 @@ def webhook():
             learn_record(symbol, display_side, t.get("score"), win_bool)
 
         state["open_trade"].pop(symbol, None)
+        stats = stats_summary(symbol)
 
         send_telegram(
             f"🏁 TRAIL EXIT\n\n"
@@ -648,7 +821,9 @@ def webhook():
             f"Exit: {fmt_price(price)}\n"
             f"Result: {outcome}\n"
             f"Quality: {score_num} ({quality})\n"
-            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}"
+            f"W/L/BE: {state['stats'][symbol]['wins']}/{state['stats'][symbol]['losses']}/{state['stats'][symbol]['be']}\n"
+            f"Win Rate: {stats['win_rate']:.1f}%\n"
+            f"Loss Rate: {stats['loss_rate']:.1f}%"
         )
         return jsonify({"ok": True, "trade_id": trade_id})
 
